@@ -118,3 +118,4 @@ def run_brainflow():
     df_brainflow.to_csv(os.path.join(save_dir, f'EEG_run-{run}.csv'), index=False)
 
     run_brainflow
+    run_brainflow
