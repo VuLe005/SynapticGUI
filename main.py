@@ -1,4 +1,6 @@
 import sys
+from threading import Thread
+
 from PySide6.QtGui import QAction, QFont
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QSplitter, QTabWidget,
@@ -6,9 +8,11 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QPoint
 
+from recorder import run_brainflow, stop_event
 from time_series_tab import TimeSeriesTab
 from network_tab import NetworkTab
 from body_tab import BodyTab
+
 
 class TabTypeDialog(QDialog):
     def __init__(self, parent=None):
@@ -18,187 +22,159 @@ class TabTypeDialog(QDialog):
         self.combo = QComboBox()
         self.combo.addItems(["Time Series", "BodyTab", "Network"])
         layout.addRow("Tab Type:", self.combo)
-        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self.buttons.accepted.connect(self.accept)
-        self.buttons.rejected.connect(self.reject)
-        layout.addRow(self.buttons)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
 
     def get_tab_type(self):
         return self.combo.currentText()
 
+
 class SynapticGUI(QMainWindow):
-    """
-    A main window with a vertical splitter (`root_vsplitter`).
-    Each 'row' is a horizontal splitter that can hold up to 3 QTabWidgets.
-    When you add a 4th tab, it creates a new horizontal splitter below the first one.
-    You can drag horizontally to resize columns, and drag vertically to resize rows.
-    """
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Synaptic GUI - 3 Columns, Then Next Row")
         self.resize(1200, 800)
         self.tab_count = 0
 
-        # A vertical splitter to hold multiple "rows"
+        # root vertical splitter
         self.root_vsplitter = QSplitter(Qt.Vertical)
         self.root_vsplitter.setOpaqueResize(False)
         self.setCentralWidget(self.root_vsplitter)
+
+        # track our horizontal “rows”
         self.rows = []
+        self._create_new_row()
+        self._setup_menu()
 
-        # Create the first row
-        self.create_new_row()
-
-        # Setup the menu bar
+    def _setup_menu(self):
         menubar = self.menuBar()
         menubar.setFont(QFont("Arial", 14))
 
         file_menu = menubar.addMenu("File")
-        add_action = QAction("Open", self)
-        add_action.triggered.connect(self.open_new_tab)
-        file_menu.addAction(add_action)
+        open_act = QAction("Open", self)
+        open_act.triggered.connect(self.open_new_tab)
+        file_menu.addAction(open_act)
 
-        help_menu = menubar.addMenu("Help")
+        connect_act = QAction("Connect", self)
+        connect_act.triggered.connect(self.connect_action_triggered)
+        menubar.addAction(connect_act)
 
-        connect_action = QAction("Connect", self)
-        connect_action.triggered.connect(self.connect_action_triggered)
-        menubar.addAction(connect_action)
+    def _create_new_row(self):
+        row = QSplitter(Qt.Horizontal)
+        row.setOpaqueResize(False)
+        self.rows.append(row)
+        self.root_vsplitter.addWidget(row)
+        self._renormalize_splitters()
+        return row
 
-        # For storing which tab was right-clicked
-        self.context_tab_index = None
-        self.context_tab_widget = None
+    def _renormalize_splitters(self):
+        # 1) Vertical: each row equal stretch
+        for i in range(self.root_vsplitter.count()):
+            self.root_vsplitter.setStretchFactor(i, 1)
+        # 2) Horizontal: each column equal stretch within each row
+        for row in self.rows:
+            for j in range(row.count()):
+                row.setStretchFactor(j, 1)
 
+    def _get_last_row(self):
+        if not self.rows or self._count_tabs(self.rows[-1]) >= 3:
+            return self._create_new_row()
+        return self.rows[-1]
 
-    # This is to create the row for the GRID
-    def create_new_row(self):
-        """
-        Create a new horizontal splitter row,
-        add it to the root vertical splitter, and store it in self.rows.
-        """
-        row_splitter = QSplitter(Qt.Horizontal)
-        row_splitter.setOpaqueResize(False)
-        self.rows.append(row_splitter)
-        self.root_vsplitter.addWidget(row_splitter)
-        return row_splitter
+    def _count_tabs(self, splitter):
+        return sum(
+            isinstance(splitter.widget(i), QTabWidget)
+            for i in range(splitter.count())
+        )
 
-    def get_or_create_last_row(self):
-        """
-        Return the last row_splitter if it has <3 tab widgets.
-        Otherwise create a new row and return that.
-        """
-        if not self.rows:
-            return self.create_new_row()
+    def _make_tab_widget(self):
+        tw = QTabWidget()
+        tw.setMovable(True)
+        tw.setMinimumWidth(50)
+        bar = tw.tabBar()
+        bar.setContextMenuPolicy(Qt.CustomContextMenu)
+        bar.customContextMenuRequested.connect(self._show_tab_menu)
+        return tw
 
-        last_row = self.rows[-1]
-        if self.count_tab_widgets_in_row(last_row) < 3:
-            return last_row
-        else:
-            return self.create_new_row()
-
-    def count_tab_widgets_in_row(self, row_splitter):
-        """Count how many QTabWidgets are in this horizontal splitter."""
-        count = 0
-        for i in range(row_splitter.count()):
-            w = row_splitter.widget(i)
-            if isinstance(w, QTabWidget):
-                count += 1
-        return count
-
-
-    def create_new_tab_widget(self):
-        """
-        Create a QTabWidget, set up the context menu, return it.
-        """
-        tab_widget = QTabWidget()
-        tab_widget.setMovable(True)
-        tab_widget.setMinimumWidth(50)  # let it shrink quite small
-        # The context menu for undocking only
-        tab_bar = tab_widget.tabBar()
-        tab_bar.setContextMenuPolicy(Qt.CustomContextMenu)
-        tab_bar.customContextMenuRequested.connect(self.show_tab_context_menu)
-        return tab_widget
-
-    def remove_empty_rows(self):
-        """
-        Check each row. If it has no QTabWidgets, remove it from root_vsplitter.
-        """
-        for i in range(len(self.rows) - 1, -1, -1):
-            row = self.rows[i]
-            if self.count_tab_widgets_in_row(row) == 0:
-                self.rows.pop(i)
-                row.setParent(None)
-                row.deleteLater()
-
-    # New tab
     def open_new_tab(self):
-        dialog = TabTypeDialog(self)
-        if dialog.exec() == QDialog.Accepted:
-            tab_type = dialog.get_tab_type()
-            if tab_type == "Time Series":
-                new_tab = TimeSeriesTab()
-            elif tab_type == "BodyTab":
-                new_tab = BodyTab()
-            else:
-                new_tab = NetworkTab()
-
-            self.tab_count += 1
-            tab_name = f"{tab_type} {self.tab_count}"
-
-            # Decide which row to put this new tab in
-            row_splitter = self.get_or_create_last_row()
-            # Create a QTabWidget for this tab
-            tab_widget = self.create_new_tab_widget()
-            tab_widget.addTab(new_tab, tab_name)
-            # Insert the tab widget into the row splitter
-            row_splitter.addWidget(tab_widget)
-
-            if tab_type == "BodyTab":
-                new_tab.highlight_part("head", 0.5)
-
-
-    def show_tab_context_menu(self, pos: QPoint):
-        """
-        Called when user right-clicks on a tab.
-        """
-        tab_bar = self.sender()
-        tab_index = tab_bar.tabAt(pos)
-        if tab_index < 0:
+        dlg = TabTypeDialog(self)
+        if dlg.exec() != QDialog.Accepted:
             return
 
-        self.context_tab_index = tab_index
-        self.context_tab_widget = tab_bar.parent()  # the QTabWidget
+        kind = dlg.get_tab_type()
+        content = {
+            "Time Series": TimeSeriesTab,
+            "BodyTab": BodyTab,
+            "Network": NetworkTab
+        }[kind]()
+        if kind == "BodyTab":
+            content.highlight_part("head", 0.5)
 
+        self.tab_count += 1
+        title = f"{kind} {self.tab_count}"
+        row = self._get_last_row()
+        tw = self._make_tab_widget()
+        tw.addTab(content, title)
+        row.addWidget(tw)
+        self._renormalize_splitters()
+
+    def _show_tab_menu(self, pos: QPoint):
+        bar = self.sender()
+        idx = bar.tabAt(pos)
+        if idx < 0:
+            return
+        self._ctx_idx = idx
+        self._ctx_tw = bar.parent()
         menu = QMenu()
-        undock_action = menu.addAction("Undock Tab")
-        action = menu.exec(tab_bar.mapToGlobal(pos))
+        undock_act = menu.addAction("Undock Tab")
+        if menu.exec(bar.mapToGlobal(pos)) == undock_act:
+            self.undock_tab(self._ctx_idx, self._ctx_tw)
 
-        if action == undock_action:
-            self.undock_tab(self.context_tab_index, self.context_tab_widget)
+    def undock_tab(self, idx, tw: QTabWidget):
+        w = tw.widget(idx)
+        tw.removeTab(idx)
+        w.setParent(None)
+        w.deleteLater()
 
-    def undock_tab(self, index, tab_widget):
-        """
-        Remove the specified tab from the QTabWidget and open it in a floating window.
-        """
-        widget = tab_widget.widget(index)
-        tab_name = tab_widget.tabText(index)
-        tab_widget.removeTab(index)
+        if tw.count() == 0:
+            tw.setParent(None)
+            tw.deleteLater()
 
-        undocked_window = QMainWindow()
-        undocked_window.setWindowTitle(f"Undocked: {tab_name}")
-        undocked_window.setCentralWidget(widget)
-        undocked_window.resize(800, 600)
-        undocked_window.show()
+        self._cleanup_empty_rows()
+        self._renormalize_splitters()
 
-        self.remove_empty_rows()
+    def _cleanup_empty_rows(self):
+        for i in reversed(range(len(self.rows))):
+            row = self.rows[i]
+            if self._count_tabs(row) == 0:
+                row.setParent(None)
+                row.deleteLater()
+                self.rows.pop(i)
 
-    # Connection to unicorn?
     def connect_action_triggered(self):
-        pass
+        # 1) (optional) open a Time-Series tab automatically
+        ts_tab = TimeSeriesTab()
+        self.tab_count += 1
+        name = f"Time Series {self.tab_count}"
+        row = self._get_last_row()
+        tw = self._make_tab_widget()
+        tw.addTab(ts_tab, name)
+        row.addWidget(tw)
+        self._renormalize_splitters()
+
+        # 2) clear any previous stop flag & start acquisition
+        stop_event.clear()
+        Thread(target=run_brainflow, daemon=True).start()
+
 
 def main():
     app = QApplication(sys.argv)
     gui = SynapticGUI()
     gui.show()
     sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     main()
